@@ -28,20 +28,11 @@ import (
 
 var updateGroup = &singleflight.Group{}
 
-type registry interface {
-	Helm(ctx context.Context, version string) (string, error)
-}
-
 // Add installs all specified Helm Chart repositories.
 // https://helm.sh/docs/topics/chart_repository/
 // helm repo add fantastic-charts https://fantastic-charts.storage.googleapis.com
 // helm repo add fantastic-charts https://fantastic-charts.storage.googleapis.com --username my-username --password my-password
-func Add(ctx context.Context, repos []config.HelmChartRepository, reg registry, logger *zap.Logger) error {
-	helm, err := reg.Helm(ctx, "")
-	if err != nil {
-		return fmt.Errorf("failed to find helm to add repos (%w)", err)
-	}
-
+func Add(ctx context.Context, helmPath string, repos []config.HelmChartRepository, logger *zap.Logger) error {
 	for _, repo := range repos {
 		args := []string{"repo", "add", repo.Name, repo.Address}
 		if repo.Insecure {
@@ -50,7 +41,7 @@ func Add(ctx context.Context, repos []config.HelmChartRepository, reg registry, 
 		if repo.Username != "" || repo.Password != "" {
 			args = append(args, "--username", repo.Username, "--password", repo.Password)
 		}
-		cmd := exec.CommandContext(ctx, helm, args...)
+		cmd := exec.CommandContext(ctx, helmPath, args...)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
 			return fmt.Errorf("failed to add chart repository %s: %s (%w)", repo.Name, string(out), err)
@@ -60,23 +51,18 @@ func Add(ctx context.Context, repos []config.HelmChartRepository, reg registry, 
 	return nil
 }
 
-func Update(ctx context.Context, reg registry, logger *zap.Logger) error {
+func Update(ctx context.Context, helmPath string, logger *zap.Logger) error {
 	_, err, _ := updateGroup.Do("update", func() (interface{}, error) {
-		return nil, update(ctx, reg, logger)
+		return nil, update(ctx, helmPath, logger)
 	})
 	return err
 }
 
-func update(ctx context.Context, reg registry, logger *zap.Logger) error {
+func update(ctx context.Context, helmPath string, logger *zap.Logger) error {
 	logger.Info("start updating Helm chart repositories")
 
-	helm, err := reg.Helm(ctx, "")
-	if err != nil {
-		return fmt.Errorf("failed to find helm to update repos (%w)", err)
-	}
-
 	args := []string{"repo", "update"}
-	cmd := exec.CommandContext(ctx, helm, args...)
+	cmd := exec.CommandContext(ctx, helmPath, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("failed to update Helm chart repositories: %s (%w)", string(out), err)

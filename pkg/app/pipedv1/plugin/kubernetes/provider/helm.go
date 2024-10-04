@@ -219,7 +219,7 @@ func (h *Helm) TemplateRemoteChart(ctx context.Context, appName, appDir, namespa
 	}
 
 	// If the error is a "Not Found", we update the repositories and try again.
-	if e := chartrepo.Update(ctx, h.toolregistry, h.logger); e != nil {
+	if e := chartrepo.Update(ctx, h.execPath, h.logger); e != nil {
 		h.logger.Error("failed to update Helm chart repositories", zap.Error(e))
 		return "", err
 	}
@@ -421,7 +421,7 @@ func (h *Helm) UpgradeRemoteChart(ctx context.Context, appName, appDir, namespac
 	}
 
 	// If the error is a "Not Found", we update the repositories and try again.
-	if e := chartrepo.Update(ctx, h.toolregistry, h.logger); e != nil {
+	if e := chartrepo.Update(ctx, h.execPath, h.logger); e != nil {
 		h.logger.Error("failed to update Helm chart repositories", zap.Error(e))
 		return "", err
 	}
