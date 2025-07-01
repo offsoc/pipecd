@@ -23,6 +23,7 @@ import (
 	"sort"
 	"time"
 
+	"github.com/google/uuid"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/atomic"
@@ -379,6 +380,10 @@ func (p *planner) buildPlan(ctx context.Context, runningDS, targetDS *common.Dep
 			p.logger.Warn("Unable to determine strategy using current plugin", zap.Error(err))
 			continue
 		}
+		// If the plugin does not support DetermineStrategy(), then ignore.
+		if res.Unsupported {
+			continue
+		}
 		strategy = res.SyncStrategy
 		summary = res.Summary
 		// If one of plugins returns PIPELINE_SYNC, use that as strategy intermediately
@@ -410,8 +415,7 @@ func (p *planner) buildPlan(ctx context.Context, runningDS, targetDS *common.Dep
 // buildQuickSyncStages requests all plugins and returns quick sync stage
 // from each plugins to build the deployment pipeline.
 // NOTE:
-//   - For quick sync, we expect all stages given by plugins can be performed
-//     at once regradless its order (aka. no `Stage.Requires` specified)
+//   - For quick sync, we expect all stages given by plugins can be performed in random order.
 //   - Rollback stage will always be added as the trail.
 func (p *planner) buildQuickSyncStages(ctx context.Context, cfg *config.GenericApplicationSpec) ([]*model.PipelineStage, error) {
 	var (
@@ -432,6 +436,7 @@ func (p *planner) buildQuickSyncStages(ctx context.Context, cfg *config.GenericA
 			return nil, err
 		}
 		for i := range res.Stages {
+			res.Stages[i].Id = uuid.New().String()
 			if res.Stages[i].Rollback {
 				rollbackStages = append(rollbackStages, res.Stages[i])
 			} else {
@@ -474,7 +479,6 @@ func (p *planner) buildPipelineSyncStages(ctx context.Context, cfg *config.Gener
 		}
 
 		stagesCfgPerPlugin[plg] = append(stagesCfgPerPlugin[plg], &deployment.BuildPipelineSyncStagesRequest_StageConfig{
-			Id:      stageCfg.ID,
 			Name:    stageCfg.Name.String(),
 			Desc:    stageCfg.Desc,
 			Timeout: stageCfg.Timeout.Duration().String(),
@@ -493,8 +497,13 @@ func (p *planner) buildPipelineSyncStages(ctx context.Context, cfg *config.Gener
 			p.logger.Error("failed to build pipeline sync stages for deployment", zap.Error(err))
 			return nil, err
 		}
-		// TODO: Ensure responsed stages indexies is valid.
+		if err := validateStageIndexes(stageCfgs, res.Stages); err != nil {
+			p.logger.Error("invalid stage index was returned from a plugin", zap.Error(err))
+			return nil, err
+		}
+
 		for i := range res.Stages {
+			res.Stages[i].Id = uuid.New().String()
 			if res.Stages[i].Rollback {
 				rollbackStages = append(rollbackStages, res.Stages[i])
 			} else {
@@ -523,6 +532,41 @@ func (p *planner) buildPipelineSyncStages(ctx context.Context, cfg *config.Gener
 		return nil, fmt.Errorf("unable to build pipeline sync stages for deployment")
 	}
 	return stages, nil
+}
+
+// validateStageIndexes validates the response stage indexes, including rollback stages, for two criteria:
+//   - duplication: Indexes of the response stages must not be duplicated within non-rollback stages and rollback stages.
+//     A non-rollback stage and a rollback stage can have the same index.
+//   - range: Each response stage must have a index defined in the request.
+func validateStageIndexes(req []*deployment.BuildPipelineSyncStagesRequest_StageConfig, res []*model.PipelineStage) error {
+	// check duplication
+	resIndexes := make(map[int32]struct{})
+	resRollbackIndexes := make(map[int32]struct{})
+	for _, resStage := range res {
+		if resStage.Rollback {
+			if _, ok := resRollbackIndexes[resStage.Index]; ok {
+				return fmt.Errorf("rollback stage index %d from plugin is duplicated", resStage.Index)
+			}
+			resRollbackIndexes[resStage.Index] = struct{}{}
+		} else {
+			if _, ok := resIndexes[resStage.Index]; ok {
+				return fmt.Errorf("stage index %d from plugin is duplicated", resStage.Index)
+			}
+			resIndexes[resStage.Index] = struct{}{}
+		}
+	}
+
+	// check range
+	reqIndexes := make(map[int32]struct{})
+	for _, reqStage := range req {
+		reqIndexes[reqStage.Index] = struct{}{}
+	}
+	for _, resStage := range res {
+		if _, ok := reqIndexes[resStage.Index]; !ok {
+			return fmt.Errorf("stage index %d from plugin is not defined in the request", resStage.Index)
+		}
+	}
+	return nil
 }
 
 func (p *planner) reportDeploymentPlanned(ctx context.Context, out *plannerOutput) error {

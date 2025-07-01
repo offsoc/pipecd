@@ -219,11 +219,10 @@ type DeploymentPipeline struct {
 // PipelineStage represents a single stage of a pipeline.
 // This is used as a generic struct for all stage type.
 type PipelineStage struct {
-	ID      string          `json:"id"`
 	Name    model.Stage     `json:"name"`
 	Desc    string          `json:"desc,omitempty"`
 	Timeout Duration        `json:"timeout"`
-	With    json.RawMessage `json:"with"`
+	With    json.RawMessage `json:"with" default:"{}"`
 	SkipOn  SkipOptions     `json:"skipOn,omitempty"`
 }
 

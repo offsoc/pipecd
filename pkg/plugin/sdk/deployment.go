@@ -39,6 +39,8 @@ type DeploymentPlugin[Config, DeployTargetConfig, ApplicationConfigSpec any] int
 	// DetermineVersions determines the versions of the resources that will be deployed.
 	DetermineVersions(context.Context, *Config, *DetermineVersionsInput[ApplicationConfigSpec]) (*DetermineVersionsResponse, error)
 	// DetermineStrategy determines the strategy to deploy the resources.
+	// This is called when the strategy was not determined by common logic, including judging by the pipeline length, whether it is the first deployment, and so on.
+	// It should return (nil, nil) if the plugin does not have specific logic for DetermineStrategy.
 	DetermineStrategy(context.Context, *Config, *DetermineStrategyInput[ApplicationConfigSpec]) (*DetermineStrategyResponse, error)
 	// BuildQuickSyncStages builds the stages that will be executed during the quick sync process.
 	BuildQuickSyncStages(context.Context, *Config, *BuildQuickSyncStagesInput) (*BuildQuickSyncStagesResponse, error)
@@ -51,6 +53,17 @@ type StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec any] interfac
 	// FetchDefinedStages returns the list of stages that the plugin can execute.
 	FetchDefinedStages() []string
 	// BuildPipelineSyncStages builds the stages that will be executed by the plugin.
+	// The built pipeline includes non-rollback (defined in the application config) and rollback stages.
+	// The request contains only non-rollback stages whose names are listed in FetchDefinedStages() of this plugin.
+	//
+	// Note about the response indexes:
+	//  - For a non-rollback stage, use the index given by the request remaining the execution order.
+	//  - For a rollback stage, use one of the indexes given by the request.
+	//  - The indexes of the response stages must not be duplicated across non-rollback stages and rollback stages.
+	//    A non-rollback stage and a rollback stage can have the same index.
+	// For example, given request indexes are {2,4,5}, then
+	//  - Non-rollback stages indexes must be {2,4,5}
+	//  - Rollback stages indexes must be selected from {2,4,5}.  For a deploymentPlugin, using only {2} is recommended.
 	BuildPipelineSyncStages(context.Context, *Config, *BuildPipelineSyncStagesInput) (*BuildPipelineSyncStagesResponse, error)
 	// ExecuteStage executes the given stage.
 	ExecuteStage(context.Context, *Config, []*DeployTarget[DeployTargetConfig], *ExecuteStageInput[ApplicationConfigSpec]) (*ExecuteStageResponse, error)
@@ -153,6 +166,14 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to determine strategy: %v", err)
 	}
+	if response == nil {
+		// If the plugin does not have specific logic to determine strategy,
+		// use PipelineSync by default.
+		response = &DetermineStrategyResponse{
+			Strategy: SyncStrategyPipelineSync,
+			Summary:  "Use PipelineSync because no other logic was matched",
+		}
+	}
 	return newDetermineStrategyResponse(response)
 }
 func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) BuildPipelineSyncStages(ctx context.Context, request *deployment.BuildPipelineSyncStagesRequest) (*deployment.BuildPipelineSyncStagesResponse, error) {
@@ -178,7 +199,7 @@ func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationCo
 	if err != nil {
 		return nil, status.Errorf(codes.Internal, "failed to build quick sync stages: %v", err)
 	}
-	return newQuickSyncStagesResponse(s.name, time.Now(), response), nil
+	return newQuickSyncStagesResponse(time.Now(), response), nil
 }
 func (s *DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]) ExecuteStage(ctx context.Context, request *deployment.ExecuteStageRequest) (response *deployment.ExecuteStageResponse, _ error) {
 	lp := s.logPersister.StageLogPersister(request.GetInput().GetDeployment().GetId(), request.GetInput().GetStage().GetId())
@@ -407,12 +428,8 @@ func newPipelineSyncStagesResponse(pluginName string, now time.Time, request *de
 		if !ok {
 			return nil, status.Errorf(codes.Internal, "missing stage with index %d in the request, it's unexpected behavior of the plugin", s.Index)
 		}
-		id := requestStage.GetId()
-		if id == "" {
-			id = fmt.Sprintf("%s-stage-%d", pluginName, s.Index)
-		}
 
-		stages = append(stages, s.toModel(id, requestStage.GetDesc(), now))
+		stages = append(stages, s.toModel(requestStage.GetDesc(), now))
 	}
 	return &deployment.BuildPipelineSyncStagesResponse{
 		Stages: stages,
@@ -420,11 +437,10 @@ func newPipelineSyncStagesResponse(pluginName string, now time.Time, request *de
 }
 
 // newQuickSyncStagesResponse converts the response to the external representation.
-func newQuickSyncStagesResponse(pluginName string, now time.Time, response *BuildQuickSyncStagesResponse) *deployment.BuildQuickSyncStagesResponse {
+func newQuickSyncStagesResponse(now time.Time, response *BuildQuickSyncStagesResponse) *deployment.BuildQuickSyncStagesResponse {
 	stages := make([]*model.PipelineStage, 0, len(response.Stages))
-	for i, s := range response.Stages {
-		id := fmt.Sprintf("%s-stage-%d", pluginName, i)
-		stages = append(stages, s.toModel(id, now))
+	for _, s := range response.Stages {
+		stages = append(stages, s.toModel(now))
 	}
 	return &deployment.BuildQuickSyncStagesResponse{
 		Stages: stages,
@@ -507,9 +523,8 @@ type PipelineStage struct {
 	AvailableOperation ManualOperation
 }
 
-func (p *PipelineStage) toModel(id, description string, now time.Time) *model.PipelineStage {
+func (p *PipelineStage) toModel(description string, now time.Time) *model.PipelineStage {
 	return &model.PipelineStage{
-		Id:                 id,
 		Name:               p.Name,
 		Desc:               description,
 		Index:              int32(p.Index),
@@ -538,9 +553,8 @@ type QuickSyncStage struct {
 	AvailableOperation ManualOperation
 }
 
-func (p *QuickSyncStage) toModel(id string, now time.Time) *model.PipelineStage {
+func (p *QuickSyncStage) toModel(now time.Time) *model.PipelineStage {
 	return &model.PipelineStage{
-		Id:                 id,
 		Name:               p.Name,
 		Desc:               p.Description,
 		Index:              0,
@@ -748,8 +762,6 @@ func (r *DetermineVersionsResponse) toModel() []*model.ArtifactVersion {
 
 // ArtifactVersion represents the version of an artifact.
 type ArtifactVersion struct {
-	// Kind is the kind of the artifact.
-	Kind ArtifactKind
 	// Version is the version of the artifact.
 	Version string
 	// Name is the name of the artifact.
@@ -761,42 +773,9 @@ type ArtifactVersion struct {
 // toModel converts the ArtifactVersion to the model.ArtifactVersion.
 func (v *ArtifactVersion) toModel() *model.ArtifactVersion {
 	return &model.ArtifactVersion{
-		Kind:    v.Kind.toModelEnum(),
 		Version: v.Version,
 		Name:    v.Name,
 		Url:     v.URL,
-	}
-}
-
-// ArtifactKind represents the kind of the artifact.
-type ArtifactKind int
-
-const (
-	// ArtifactKindUnknown indicates that the kind of the artifact is unknown.
-	ArtifactKindUnknown ArtifactKind = iota
-	// ArtifactKindContainerImage indicates that the artifact is a container image.
-	ArtifactKindContainerImage
-	// ArtifactKindS3Object indicates that the artifact is an S3 object.
-	ArtifactKindS3Object
-	// ArtifactKindGitSource indicates that the artifact is a git source.
-	ArtifactKindGitSource
-	// ArtifactKindTerraformModule indicates that the artifact is a terraform module.
-	ArtifactKindTerraformModule
-)
-
-// toModelEnum converts the ArtifactKind to the model.ArtifactVersion_Kind.
-func (k ArtifactKind) toModelEnum() model.ArtifactVersion_Kind {
-	switch k {
-	case ArtifactKindContainerImage:
-		return model.ArtifactVersion_CONTAINER_IMAGE
-	case ArtifactKindS3Object:
-		return model.ArtifactVersion_S3_OBJECT
-	case ArtifactKindGitSource:
-		return model.ArtifactVersion_GIT_SOURCE
-	case ArtifactKindTerraformModule:
-		return model.ArtifactVersion_TERRAFORM_MODULE
-	default:
-		return model.ArtifactVersion_UNKNOWN
 	}
 }
 
