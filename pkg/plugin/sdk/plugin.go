@@ -16,6 +16,7 @@ package sdk
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/pprof"
@@ -53,14 +54,34 @@ type DeployTarget[Config any] struct {
 	Config Config `json:"config"`
 }
 
-type commonFields struct {
-	name         string
-	version      string
-	config       *config.PipedPlugin
-	logger       *zap.Logger
-	logPersister logPersister
-	client       *pluginServiceClient
-	toolRegistry *toolregistry.ToolRegistry
+// InitializeInput is the input for the Initializer interface.
+type InitializeInput[Config, DeployTargetConfig any] struct {
+	// Config is the configuration of the plugin.
+	Config *Config
+	// DeployTargets is the deploy targets of the plugin.
+	DeployTargets map[string]*DeployTarget[DeployTargetConfig]
+	// Logger is the logger for the plugin.
+	Logger *zap.Logger
+}
+
+// Initializer is an interface that defines the Initialize method.
+type Initializer[Config, DeployTargetConfig any] interface {
+	// Initialize initializes the plugin with the given context and input.
+	// It is called multiple times when the plugin is registered multiple times, such as deployment, livestate, and plan-preview plugins.
+	// It is recommended to use sync.Once to ensure that the plugin is initialized only once.
+	Initialize(context.Context, *InitializeInput[Config, DeployTargetConfig]) error
+}
+
+type commonFields[Config, DeployTargetConfig any] struct {
+	name          string
+	version       string
+	config        *config.PipedPlugin
+	logger        *zap.Logger
+	logPersister  logPersister
+	client        *pluginServiceClient
+	toolRegistry  *toolregistry.ToolRegistry
+	pluginConfig  *Config
+	deployTargets map[string]*DeployTarget[DeployTargetConfig]
 }
 
 type logPersister interface {
@@ -68,7 +89,7 @@ type logPersister interface {
 }
 
 // withLogger copies the commonFields and sets the logger to the given one.
-func (c commonFields) withLogger(logger *zap.Logger) commonFields {
+func (c commonFields[Config, DeployTargetConfig]) withLogger(logger *zap.Logger) commonFields[Config, DeployTargetConfig] {
 	c.logger = logger
 	return c
 }
@@ -99,6 +120,13 @@ func WithLivestatePlugin[Config, DeployTargetConfig, ApplicationConfigSpec any](
 	}
 }
 
+// WithPlanPreviewPlugin is a function that sets the plan preview plugin.
+func WithPlanPreviewPlugin[Config, DeployTargetConfig, ApplicationConfigSpec any](planPreviewPlugin PlanPreviewPlugin[Config, DeployTargetConfig, ApplicationConfigSpec]) PluginOption[Config, DeployTargetConfig, ApplicationConfigSpec] {
+	return func(plugin *Plugin[Config, DeployTargetConfig, ApplicationConfigSpec]) {
+		plugin.planPreviewPlugin = planPreviewPlugin
+	}
+}
+
 // Plugin is a wrapper for the plugin.
 // It provides a way to run the plugin with the given config and deploy target config.
 type Plugin[Config, DeployTargetConfig, ApplicationConfigSpec any] struct {
@@ -109,9 +137,10 @@ type Plugin[Config, DeployTargetConfig, ApplicationConfigSpec any] struct {
 	name string
 
 	// plugin implementations
-	stagePlugin      StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
-	deploymentPlugin DeploymentPlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
-	livestatePlugin  LivestatePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
+	stagePlugin       StagePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
+	deploymentPlugin  DeploymentPlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
+	livestatePlugin   LivestatePlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
+	planPreviewPlugin PlanPreviewPlugin[Config, DeployTargetConfig, ApplicationConfigSpec]
 
 	// command line options
 	pipedPluginService   string
@@ -227,11 +256,16 @@ func (p *Plugin[Config, DeployTargetConfig, ApplicationConfigSpec]) run(ctx cont
 		return err
 	}
 
+	logger := input.Logger.With(
+		zap.String("plugin-name", cfg.Name),
+		zap.String("plugin-version", p.version),
+	)
+
 	// Start running admin server.
 	{
 		var (
 			ver   = []byte(p.version)
-			admin = admin.NewAdmin(0, p.gracePeriod, input.Logger) // TODO: add config for admin port
+			admin = admin.NewAdmin(0, p.gracePeriod, logger) // TODO: add config for admin port
 		)
 
 		admin.HandleFunc("/version", func(w http.ResponseWriter, r *http.Request) {
@@ -250,14 +284,14 @@ func (p *Plugin[Config, DeployTargetConfig, ApplicationConfigSpec]) run(ctx cont
 	}
 
 	// Start log persister
-	persister := logpersister.NewPersister(pipedPluginServiceClient, input.Logger)
+	persister := logpersister.NewPersister(pipedPluginServiceClient, logger)
 	group.Go(func() error {
 		return persister.Run(ctx)
 	})
 
 	// Start a gRPC server for handling external API requests.
 	{
-		commonFields := commonFields{
+		commonFields := commonFields[Config, DeployTargetConfig]{
 			name:         cfg.Name,
 			version:      p.version,
 			config:       cfg,
@@ -266,45 +300,95 @@ func (p *Plugin[Config, DeployTargetConfig, ApplicationConfigSpec]) run(ctx cont
 			toolRegistry: toolregistry.NewToolRegistry(pipedPluginServiceClient),
 		}
 
+		if cfg.Config != nil {
+			if err := json.Unmarshal(cfg.Config, &commonFields.pluginConfig); err != nil {
+				logger.Fatal("failed to unmarshal the plugin config", zap.Error(err))
+				return err
+			}
+		}
+
+		commonFields.deployTargets = make(map[string]*DeployTarget[DeployTargetConfig], len(cfg.DeployTargets))
+		for _, dt := range cfg.DeployTargets {
+			var sdkDt DeployTargetConfig
+			if err := json.Unmarshal(dt.Config, &sdkDt); err != nil {
+				logger.Fatal("failed to unmarshal deploy target config", zap.Error(err))
+				return err
+			}
+			commonFields.deployTargets[dt.Name] = &DeployTarget[DeployTargetConfig]{
+				Name:   dt.Name,
+				Labels: dt.Labels,
+				Config: sdkDt,
+			}
+		}
+
+		initializeInput := &InitializeInput[Config, DeployTargetConfig]{
+			Config:        commonFields.pluginConfig,
+			DeployTargets: commonFields.deployTargets,
+			Logger:        logger.Named("plugin-initializer"),
+		}
+
 		var services []rpc.Service
 
 		if p.stagePlugin != nil {
-			stagePluginServiceServer := &StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]{base: p.stagePlugin}
-			if err := stagePluginServiceServer.setFields(
-				commonFields.withLogger(input.Logger.Named("stage-service")),
-			); err != nil {
-				input.Logger.Error("failed to set fields", zap.Error(err))
-				return err
+			if initializer, ok := p.stagePlugin.(Initializer[Config, DeployTargetConfig]); ok {
+				if err := initializer.Initialize(ctx, initializeInput); err != nil {
+					logger.Error("failed to initialize stage plugin", zap.Error(err))
+					return err
+				}
+			}
+			stagePluginServiceServer := &StagePluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]{
+				base:         p.stagePlugin,
+				commonFields: commonFields.withLogger(logger.Named("stage-service")),
 			}
 			services = append(services, stagePluginServiceServer)
 		}
 
 		if p.deploymentPlugin != nil {
-			deploymentPluginServiceServer := &DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]{base: p.deploymentPlugin}
-			if err := deploymentPluginServiceServer.setFields(
-				commonFields.withLogger(input.Logger.Named("deployment-service")),
-			); err != nil {
-				input.Logger.Error("failed to set fields", zap.Error(err))
-				return err
+			if initializer, ok := p.deploymentPlugin.(Initializer[Config, DeployTargetConfig]); ok {
+				if err := initializer.Initialize(ctx, initializeInput); err != nil {
+					logger.Error("failed to initialize deployment plugin", zap.Error(err))
+					return err
+				}
+			}
+			deploymentPluginServiceServer := &DeploymentPluginServiceServer[Config, DeployTargetConfig, ApplicationConfigSpec]{
+				base:         p.deploymentPlugin,
+				commonFields: commonFields.withLogger(logger.Named("deployment-service")),
 			}
 			services = append(services, deploymentPluginServiceServer)
 		}
 
 		if p.livestatePlugin != nil {
-			livestatePluginServiceServer := &LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec]{base: p.livestatePlugin}
-			if err := livestatePluginServiceServer.setFields(
-				commonFields.withLogger(input.Logger.Named("livestate-service")),
-			); err != nil {
-				input.Logger.Error("failed to set fields", zap.Error(err))
-				return err
+			if initializer, ok := p.livestatePlugin.(Initializer[Config, DeployTargetConfig]); ok {
+				if err := initializer.Initialize(ctx, initializeInput); err != nil {
+					logger.Error("failed to initialize livestate plugin", zap.Error(err))
+					return err
+				}
+			}
+			livestatePluginServiceServer := &LivestatePluginServer[Config, DeployTargetConfig, ApplicationConfigSpec]{
+				base:         p.livestatePlugin,
+				commonFields: commonFields.withLogger(logger.Named("livestate-service")),
 			}
 			services = append(services, livestatePluginServiceServer)
+		}
+
+		if p.planPreviewPlugin != nil {
+			if initializer, ok := p.planPreviewPlugin.(Initializer[Config, DeployTargetConfig]); ok {
+				if err := initializer.Initialize(ctx, initializeInput); err != nil {
+					logger.Error("failed to initialize plan-preview plugin", zap.Error(err))
+					return err
+				}
+			}
+			planPreviewPluginServiceServer := &PlanPreviewPluginServer[Config, DeployTargetConfig, ApplicationConfigSpec]{
+				base:         p.planPreviewPlugin,
+				commonFields: commonFields.withLogger(logger.Named("plan-preview-service")),
+			}
+			services = append(services, planPreviewPluginServiceServer)
 		}
 
 		if len(services) == 0 {
 			// This is promised in the NewPlugin function.
 			// When this happens, it means that *Plugin was initialized without using NewPlugin.
-			input.Logger.Error(
+			logger.Error(
 				"no plugin is registered, plugin implementation must use NewPlugin to initialize the plugin",
 				zap.String("name", p.name),
 				zap.String("version", p.version),
@@ -316,8 +400,8 @@ func (p *Plugin[Config, DeployTargetConfig, ApplicationConfigSpec]) run(ctx cont
 			opts = []rpc.Option{
 				rpc.WithPort(cfg.Port),
 				rpc.WithGracePeriod(p.gracePeriod),
-				rpc.WithLogger(input.Logger),
-				rpc.WithLogUnaryInterceptor(input.Logger),
+				rpc.WithLogger(logger),
+				rpc.WithLogUnaryInterceptor(logger),
 				rpc.WithRequestValidationUnaryInterceptor(),
 				rpc.WithSignalHandlingUnaryInterceptor(),
 			}
@@ -345,7 +429,7 @@ func (p *Plugin[Config, DeployTargetConfig, ApplicationConfigSpec]) run(ctx cont
 	}
 
 	if err := group.Wait(); err != nil {
-		input.Logger.Error("failed while running", zap.Error(err))
+		logger.Error("failed while running", zap.Error(err))
 		return err
 	}
 	return nil

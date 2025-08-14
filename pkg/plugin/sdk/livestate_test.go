@@ -37,32 +37,24 @@ type mockLivestatePlugin struct {
 	err    error
 }
 
-func (m *mockLivestatePlugin) Name() string {
-	return "mockLivestatePlugin"
-}
-
-func (m *mockLivestatePlugin) Version() string {
-	return "v1.0.0"
-}
-
-func (m *mockLivestatePlugin) GetLivestate(ctx context.Context, config *struct{}, targets []*DeployTarget[struct{}], input *GetLivestateInput[struct{}]) (*GetLivestateResponse, error) {
+func (m *mockLivestatePlugin) GetLivestate(ctx context.Context, config ConfigNone, targets DeployTargetsNone, input *GetLivestateInput[struct{}]) (*GetLivestateResponse, error) {
 	return m.result, m.err
 }
 
 func newTestLivestatePluginServer(t *testing.T, plugin *mockLivestatePlugin) *LivestatePluginServer[struct{}, struct{}, struct{}] {
 	return &LivestatePluginServer[struct{}, struct{}, struct{}]{
 		base: plugin,
-		commonFields: commonFields{
+		commonFields: commonFields[struct{}, struct{}]{
 			logger: zaptest.NewLogger(t),
 			config: &config.PipedPlugin{
 				Name: "mockLivestatePlugin",
 			},
-		},
-		deployTargets: map[string]*DeployTarget[struct{}]{
-			"target1": {
-				Name: "target1",
-				Labels: map[string]string{
-					"key1": "value1",
+			deployTargets: map[string]*DeployTarget[struct{}]{
+				"target1": {
+					Name: "target1",
+					Labels: map[string]string{
+						"key1": "value1",
+					},
 				},
 			},
 		},

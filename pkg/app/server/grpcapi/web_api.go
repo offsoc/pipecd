@@ -163,20 +163,19 @@ func NewWebAPI(
 	encrypter encrypter,
 	logger *zap.Logger,
 ) *WebAPI {
-	w := datastore.WebCommander
 	a := &WebAPI{
-		applicationStore:          datastore.NewApplicationStore(ds, w),
-		deploymentChainStore:      datastore.NewDeploymentChainStore(ds, w),
-		deploymentStore:           datastore.NewDeploymentStore(ds, w),
-		deploymentTraceStore:      datastore.NewDeploymentTraceStore(ds, w),
-		pipedStore:                datastore.NewPipedStore(ds, w),
-		projectStore:              datastore.NewProjectStore(ds, w),
-		apiKeyStore:               datastore.NewAPIKeyStore(ds, w),
+		applicationStore:          datastore.NewApplicationStore(ds),
+		deploymentChainStore:      datastore.NewDeploymentChainStore(ds),
+		deploymentStore:           datastore.NewDeploymentStore(ds),
+		deploymentTraceStore:      datastore.NewDeploymentTraceStore(ds),
+		pipedStore:                datastore.NewPipedStore(ds),
+		projectStore:              datastore.NewProjectStore(ds),
+		apiKeyStore:               datastore.NewAPIKeyStore(ds),
 		apiKeyLastUsedStore:       akluc,
-		eventStore:                datastore.NewEventStore(ds, w),
+		eventStore:                datastore.NewEventStore(ds),
 		stageLogStore:             sls,
 		applicationLiveStateStore: alss,
-		commandStore:              commandstore.NewStore(w, ds, sc, logger),
+		commandStore:              commandstore.NewStore(ds, sc, logger),
 		insightProvider:           ip,
 		unregisteredAppStore:      uas,
 		projectsInConfig:          projs,
@@ -1250,7 +1249,10 @@ func validateApprover(stages []*model.PipelineStage, commander, stageID string) 
 		if s.Id != stageID {
 			continue
 		}
-		if as := s.Metadata["Approvers"]; as != "" {
+		if aos := s.AuthorizedOperators; len(aos) > 0 {
+			approvers = aos
+		} else if as := s.Metadata["Approvers"]; as != "" {
+			// TODO: Remove this if-clause after most deployments with 'Approvers' metadata are finished.
 			approvers = strings.Split(as, ",")
 		}
 		break

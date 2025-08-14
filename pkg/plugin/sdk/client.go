@@ -29,6 +29,13 @@ import (
 )
 
 const (
+	// MetadataKeyStageDisplay is the key of the stage metadata to be displayed on the deployment detail UI.
+	MetadataKeyStageDisplay = model.MetadataKeyStageDisplay
+	// MetadataKeyStageApprovedUsers is the key of the metadata of who approved the stage.
+	// It will be displayed in the DEPLOYMENT_APPROVED notification.
+	// e.g. user-1,user-2
+	MetadataKeyStageApprovedUsers = model.MetadataKeyStageApprovedUsers
+
 	listStageCommandsInterval = 5 * time.Second
 )
 
@@ -116,16 +123,16 @@ type StageLogPersister interface {
 }
 
 // GetStageMetadata gets the metadata of the current stage.
-func (c *Client) GetStageMetadata(ctx context.Context, key string) (string, error) {
+func (c *Client) GetStageMetadata(ctx context.Context, key string) (string, bool, error) {
 	resp, err := c.base.GetStageMetadata(ctx, &pipedservice.GetStageMetadataRequest{
 		DeploymentId: c.deploymentID,
 		StageId:      c.stageID,
 		Key:          key,
 	})
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return resp.Value, nil
+	return resp.Value, resp.Found, nil
 }
 
 // PutStageMetadata stores the metadata of the current stage.
@@ -150,13 +157,16 @@ func (c *Client) PutStageMetadataMulti(ctx context.Context, metadata map[string]
 }
 
 // GetDeploymentPluginMetadata gets the metadata of the current deployment and plugin.
-func (c *Client) GetDeploymentPluginMetadata(ctx context.Context, key string) (string, error) {
+func (c *Client) GetDeploymentPluginMetadata(ctx context.Context, key string) (string, bool, error) {
 	resp, err := c.base.GetDeploymentPluginMetadata(ctx, &pipedservice.GetDeploymentPluginMetadataRequest{
 		DeploymentId: c.deploymentID,
 		PluginName:   c.pluginName,
 		Key:          key,
 	})
-	return resp.Value, err
+	if err != nil {
+		return "", false, err
+	}
+	return resp.Value, resp.Found, err
 }
 
 // PutDeploymentPluginMetadata stores the metadata of the current deployment and plugin.
@@ -182,12 +192,39 @@ func (c *Client) PutDeploymentPluginMetadataMulti(ctx context.Context, metadata 
 
 // GetDeploymentSharedMetadata gets the metadata of the current deployment
 // which is shared among piped and plugins.
-func (c *Client) GetDeploymentSharedMetadata(ctx context.Context, key string) (string, error) {
+func (c *Client) GetDeploymentSharedMetadata(ctx context.Context, key string) (string, bool, error) {
 	resp, err := c.base.GetDeploymentSharedMetadata(ctx, &pipedservice.GetDeploymentSharedMetadataRequest{
 		DeploymentId: c.deploymentID,
 		Key:          key,
 	})
-	return resp.Value, err
+	if err != nil {
+		return "", false, err
+	}
+	return resp.Value, resp.Found, err
+}
+
+// GetApplicationSharedObject gets the application object which is shared across deployments.
+func (c *Client) GetApplicationSharedObject(ctx context.Context, key string) ([]byte, error) {
+	resp, err := c.base.GetApplicationSharedObject(ctx, &pipedservice.GetApplicationSharedObjectRequest{
+		ApplicationId: c.applicationID,
+		PluginName:    c.pluginName,
+		Key:           key,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Object, nil
+}
+
+// PutApplicationSharedObject stores the application object which is shared across deployments.
+func (c *Client) PutApplicationSharedObject(ctx context.Context, key string, object []byte) error {
+	_, err := c.base.PutApplicationSharedObject(ctx, &pipedservice.PutApplicationSharedObjectRequest{
+		ApplicationId: c.applicationID,
+		PluginName:    c.pluginName,
+		Key:           key,
+		Object:        object,
+	})
+	return err
 }
 
 // LogPersister returns the stage log persister.
@@ -206,9 +243,21 @@ func (c *Client) ToolRegistry() *toolregistry.ToolRegistry {
 }
 
 // ListStageCommands returns the list of stage commands of the given command types.
-func (c Client) ListStageCommands(ctx context.Context, commandTypes ...model.Command_Type) iter.Seq2[*StageCommand, error] {
+func (c Client) ListStageCommands(ctx context.Context, commandTypes ...CommandType) iter.Seq2[*StageCommand, error] {
 	return func(yield func(*StageCommand, error) bool) {
 		returned := map[string]struct{}{}
+
+		modelCommandTypes := make([]model.Command_Type, 0, len(commandTypes))
+		for _, cmdType := range commandTypes {
+			modelType, err := cmdType.toModelEnum()
+			if err != nil {
+				if !yield(nil, err) {
+					return
+				}
+				continue
+			}
+			modelCommandTypes = append(modelCommandTypes, modelType)
+		}
 
 		for {
 			resp, err := c.base.ListStageCommands(ctx, &pipedservice.ListStageCommandsRequest{
@@ -223,7 +272,7 @@ func (c Client) ListStageCommands(ctx context.Context, commandTypes ...model.Com
 			}
 
 			for _, command := range resp.Commands {
-				if !slices.Contains(commandTypes, command.Type) {
+				if !slices.Contains(modelCommandTypes, command.Type) {
 					continue
 				}
 

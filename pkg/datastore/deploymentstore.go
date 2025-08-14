@@ -16,15 +16,14 @@ package datastore
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/pipe-cd/pipecd/pkg/model"
 )
 
 type deploymentCollection struct {
-	requestedBy Commander
 }
 
 func (d *deploymentCollection) Kind() string {
@@ -35,38 +34,6 @@ func (d *deploymentCollection) Factory() Factory {
 	return func() interface{} {
 		return &model.Deployment{}
 	}
-}
-
-func (d *deploymentCollection) ListInUsedShards() []Shard {
-	return []Shard{
-		AgentShard,
-	}
-}
-
-func (d *deploymentCollection) GetUpdatableShard() (Shard, error) {
-	switch d.requestedBy {
-	case PipedCommander:
-		return AgentShard, nil
-	default:
-		return "", ErrUnsupported
-	}
-}
-
-func (d *deploymentCollection) Encode(e interface{}) (map[Shard][]byte, error) {
-	const errFmt = "failed while encode Deployment object: %s"
-
-	me, ok := e.(*model.Deployment)
-	if !ok {
-		return nil, fmt.Errorf("type not matched")
-	}
-
-	data, err := json.Marshal(me)
-	if err != nil {
-		return nil, fmt.Errorf(errFmt, "unable to marshal entity data")
-	}
-	return map[Shard][]byte{
-		AgentShard: data,
-	}, nil
 }
 
 var (
@@ -138,24 +105,25 @@ type DeploymentStore interface {
 	UpdateToCompleted(ctx context.Context, id string, status model.DeploymentStatus, stageStatuses map[string]model.StageStatus, reason string, completedAt int64) error
 	UpdateStatus(ctx context.Context, id string, status model.DeploymentStatus, reason string) error
 	UpdateStageStatus(ctx context.Context, id, stageID string, status model.StageStatus, reason string, requires []string, visible bool, retriedCount int32, completedAt int64) error
+	// Deprecated: Use UpdateSharedMetadata or UpdatePluginMetadata instead in pipedv1. UpdateMetadata is for pipedv0.
 	UpdateMetadata(ctx context.Context, id string, metadata map[string]string) error
 	UpdateStageMetadata(ctx context.Context, deploymentID, stageID string, metadata map[string]string) error
+	UpdateSharedMetadata(ctx context.Context, id string, metadata map[string]string) error
+	UpdatePluginMetadata(ctx context.Context, id string, pluginName string, metadata map[string]string) error
 }
 
 type deploymentStore struct {
 	backend
-	commander Commander
-	nowFunc   func() time.Time
+	nowFunc func() time.Time
 }
 
-func NewDeploymentStore(ds DataStore, c Commander) DeploymentStore {
+func NewDeploymentStore(ds DataStore) DeploymentStore {
 	return &deploymentStore{
 		backend: backend{
 			ds:  ds,
-			col: &deploymentCollection{requestedBy: c},
+			col: &deploymentCollection{},
 		},
-		commander: c,
-		nowFunc:   time.Now,
+		nowFunc: time.Now,
 	}
 }
 
@@ -167,6 +135,23 @@ func (s *deploymentStore) Add(ctx context.Context, d *model.Deployment) error {
 	if d.UpdatedAt == 0 {
 		d.UpdatedAt = now
 	}
+
+	// To make compatibility with pipedv0 and pipedv1 on the UI.
+	// TODO: Remove this block after ending support of pipedv0.
+	if len(d.DeployTargetsByPlugin) == 0 {
+		for _, s := range d.Stages {
+			switch s.Name {
+			case model.StageAnalysis.String():
+				s.AvailableOperation = model.ManualOperation_MANUAL_OPERATION_SKIP
+			case model.StageWaitApproval.String():
+				s.AvailableOperation = model.ManualOperation_MANUAL_OPERATION_APPROVE
+				if approvers := s.Metadata["Approvers"]; approvers != "" {
+					s.AuthorizedOperators = strings.Split(approvers, ",")
+				}
+			}
+		}
+	}
+
 	if err := d.Validate(); err != nil {
 		return err
 	}
@@ -258,6 +243,30 @@ func (s *deploymentStore) UpdateStageMetadata(ctx context.Context, deploymentID,
 			}
 		}
 		return fmt.Errorf("stage %s is not found: %w", stageID, ErrInvalidArgument)
+	})
+}
+
+func (s *deploymentStore) UpdateSharedMetadata(ctx context.Context, id string, metadata map[string]string) error {
+	return s.update(ctx, id, func(d *model.Deployment) error {
+		if d.MetadataV2.Shared == nil {
+			d.MetadataV2.Shared = &model.DeploymentMetadata_KeyValues{}
+		}
+		d.MetadataV2.Shared = &model.DeploymentMetadata_KeyValues{
+			KeyValues: mergeMetadata(d.MetadataV2.Shared.KeyValues, metadata),
+		}
+		return nil
+	})
+}
+
+func (s *deploymentStore) UpdatePluginMetadata(ctx context.Context, id string, pluginName string, metadata map[string]string) error {
+	return s.update(ctx, id, func(d *model.Deployment) error {
+		if d.MetadataV2.Plugins == nil {
+			d.MetadataV2.Plugins = make(map[string]*model.DeploymentMetadata_KeyValues)
+		}
+		d.MetadataV2.Plugins[pluginName] = &model.DeploymentMetadata_KeyValues{
+			KeyValues: mergeMetadata(d.MetadataV2.Plugins[pluginName].KeyValues, metadata),
+		}
+		return nil
 	})
 }
 

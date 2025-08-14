@@ -19,7 +19,7 @@
 build: build/go build/web
 
 .PHONY: build/go
-build/go: BUILD_VERSION ?= $(shell git describe --tags --always --dirty --abbrev=7)
+build/go: BUILD_VERSION ?= $(shell git describe --tags --always --dirty --abbrev=7 --match 'v[0-9]*.*')
 build/go: BUILD_COMMIT ?= $(shell git rev-parse HEAD)
 build/go: BUILD_DATE ?= $(shell date -u '+%Y%m%d-%H%M%S')
 build/go: BUILD_LDFLAGS_PREFIX := -X github.com/pipe-cd/pipecd/pkg/version
@@ -78,7 +78,7 @@ build/plugin:
 
 .PHONY: push
 push/chart: BUCKET ?= charts.pipecd.dev
-push/chart: VERSION ?= $(shell git describe --tags --always --dirty --abbrev=7)
+push/chart: VERSION ?= $(shell git describe --tags --always --dirty --abbrev=7 --match 'v[0-9]*.*')
 push/chart: CREDENTIALS_FILE ?= ~/.config/gcloud/application_default_credentials.json
 push/chart:
 	@yq -i '.version = "${VERSION}" | .appVersion = "${VERSION}"' manifests/pipecd/Chart.yaml
@@ -258,7 +258,7 @@ update/copyright:
 .PHONY: gen/code
 gen/code:
 	# NOTE: Keep this container image as same as defined in .github/workflows/gen.yml
-	docker run --rm -v ${PWD}:/repo -it --entrypoint ./tool/codegen/codegen.sh ghcr.io/pipe-cd/codegen@sha256:831f2dda2f56b1d12e90f88c0cb4168f51aa4eb5907b468e74bc42670939fff2 /repo # v0.50.0-215-g3f6a738
+	docker run --rm -v ${PWD}:/repo -it --entrypoint ./tool/codegen/codegen.sh ghcr.io/pipe-cd/codegen@sha256:3aa25a5abafe40419861ce1f1667580d4274e144370d03ce9f1d00e9b391d7fd /repo # v0.52.0-135-gcefd641
 
 .PHONY: gen/test-tls
 gen/test-tls:
@@ -267,10 +267,6 @@ gen/test-tls:
 		-out pkg/rpc/testdata/tls.crt \
 		-subj "/CN=localhost" \
 		-config pkg/rpc/testdata/tls.config
-
-.PHONY: gen/contributions
-gen/contributions:
-	./hack/gen-contributions.sh
 
 .PHONY: release
 release: release/init release/docs

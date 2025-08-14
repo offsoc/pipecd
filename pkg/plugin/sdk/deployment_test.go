@@ -35,14 +35,6 @@ type mockStagePlugin struct {
 	err    error
 }
 
-func (m *mockStagePlugin) Name() string {
-	return "mockStagePlugin"
-}
-
-func (m *mockStagePlugin) Version() string {
-	return "v1.0.0"
-}
-
 func (m *mockStagePlugin) FetchDefinedStages() []string {
 	return []string{"stage1", "stage2"}
 }
@@ -76,7 +68,7 @@ func (m *mockStagePlugin) ExecuteStage(ctx context.Context, config *struct{}, ta
 func newTestStagePluginServiceServer(t *testing.T, plugin *mockStagePlugin) *StagePluginServiceServer[struct{}, struct{}, struct{}] {
 	return &StagePluginServiceServer[struct{}, struct{}, struct{}]{
 		base: plugin,
-		commonFields: commonFields{
+		commonFields: commonFields[struct{}, struct{}]{
 			logger:       zaptest.NewLogger(t),
 			logPersister: logpersistertest.NewTestLogPersister(t),
 		},
